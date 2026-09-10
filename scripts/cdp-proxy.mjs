@@ -99,7 +99,24 @@ async function discoverChromePort() {
   return null;
 }
 
-function getWebSocketUrl(port, wsPath) {
+
+async function fetchBrowserWsPath(port) {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    if (!data?.webSocketDebuggerUrl) return null;
+    return data.webSocketDebuggerUrl
+  } catch {
+    return null;
+  }
+}
+
+async function getWebSocketUrl(port, wsPath) {
+  const livePath = await fetchBrowserWsPath(port);
+  if (livePath) {
+    return livePath
+  }
   if (wsPath) return `ws://127.0.0.1:${port}${wsPath}`;
   return `ws://127.0.0.1:${port}/devtools/browser`;
 }
@@ -127,7 +144,7 @@ async function connect() {
     chromeWsPath = discovered.wsPath;
   }
 
-  const wsUrl = getWebSocketUrl(chromePort, chromeWsPath);
+  const wsUrl = await getWebSocketUrl(chromePort, chromeWsPath);
   if (!wsUrl) throw new Error('无法获取 Chrome WebSocket URL');
 
   return connectingPromise = new Promise((resolve, reject) => {
