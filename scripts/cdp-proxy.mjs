@@ -53,6 +53,18 @@ let connectedBrowser = null; // { id, label, source }
 // pin 首次成功连接的浏览器 id。重连时只接受同一 id，避免悄悄降级到别的浏览器。
 let pinnedBrowserId = null;
 
+// 是否 headless 浏览器。headless=new 下 hidden tab 不产帧，截图必须先把 tab 前置；
+// 而有头浏览器里 bringToFront 会抢用户正在看的 tab，所以自动前置只在 headless 下默认开。
+// 判定在 fetchBrowserWsPath 连浏览器时顺手做。
+let isHeadlessBrowser = false;
+
+// 截图前是否自动 bringToFront。CDP_SCREENSHOT_AUTO_FRONT=1/0 可强制覆盖。
+function screenshotAutoFront() {
+  const v = (process.env.CDP_SCREENSHOT_AUTO_FRONT || '').trim().toLowerCase();
+  if (v) return v === '1' || v === 'true' || v === 'on';
+  return isHeadlessBrowser;
+}
+
 // --- 自动发现浏览器调试端口 ---
 // 决策完全委派给 browser-discovery.selectBrowser；此处只做日志和返回结构包装。
 async function discoverChromePort() {
@@ -106,6 +118,13 @@ async function fetchBrowserWsPath(port) {
     if (!resp.ok) return null;
     const data = await resp.json();
     if (!data?.webSocketDebuggerUrl) return null;
+    // 顺手记下是否 headless，供截图自动前置策略使用。
+    // Chrome 153 的 Browser 字段是 "Chrome/x.y"，headless 标记只在 User-Agent 里，两个都要查。
+    const ua = typeof data['User-Agent'] === 'string' ? data['User-Agent'] : '';
+    const browser = typeof data.Browser === 'string' ? data.Browser : '';
+    if (ua || browser) {
+      isHeadlessBrowser = /HeadlessChrome|HeadlessEdge/i.test(`${browser} ${ua}`);
+    }
     return data.webSocketDebuggerUrl
   } catch {
     return null;
@@ -248,6 +267,25 @@ async function ensureSession(targetId) {
   throw new Error('attach 失败: ' + JSON.stringify(resp.error));
 }
 
+// --- 截图前置：激活 tab ---
+// headless=new 下 hidden tab 不产帧，Page.captureScreenshot 会挂到 sendCDP 的 30s 超时。
+// Page.bringToFront 后同一请求通常 20~45ms 返回。
+async function bringToFront(targetId) {
+  const sid = await ensureSession(targetId);
+  await sendCDP('Page.bringToFront', {}, sid);
+  // 等一帧绘制，避免截到切换前的画面。必须同时带超时和 .catch()：
+  // 窗口最小化时 rAF 永不触发，裸 await 会挂满 30s；而 race 结束后延迟到达的 reject
+  // 若无人处理会变成 unhandled rejection，能直接崩掉 proxy 进程。
+  await Promise.race([
+    sendCDP('Runtime.evaluate', {
+      expression: 'new Promise(r=>requestAnimationFrame(()=>r(1)))',
+      awaitPromise: true, returnByValue: true,
+    }, sid).catch(() => {}),
+    new Promise(r => setTimeout(r, 500)),
+  ]);
+  return sid;
+}
+
 // 拦截页面对 Chrome 调试端口的探测（反风控）
 // 只拦截 127.0.0.1:{chromePort} 的请求，不影响其他任何本地服务
 async function enablePortGuard(sessionId) {
@@ -356,6 +394,7 @@ const server = http.createServer(async (req, res) => {
         sessions: sessions.size,
         managedTabs: managedTabs.size,
         chromePort,
+        headless: isHeadlessBrowser,
       }));
       return;
     }
@@ -584,16 +623,53 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ value: resp.result?.result?.value }));
     }
 
-    // GET /screenshot?target=xxx&file=/tmp/x.png - 截图
-    else if (pathname === '/screenshot') {
-      const sid = await ensureSession(q.target);
-      const format = q.format || 'png';
-      const resp = await sendCDP('Page.captureScreenshot', {
-        format,
-        quality: format === 'jpeg' ? 80 : undefined,
+    // GET /toFront?target=xxx - 激活 tab 到前台，返回可见性状态
+    // headless 下截图/录屏前调用；有头浏览器会抢用户焦点，慎用
+    else if (pathname === '/toFront') {
+      const sid = await bringToFront(q.target);
+      const r = await sendCDP('Runtime.evaluate', {
+        expression: 'JSON.stringify({visibility:document.visibilityState,hasFocus:document.hasFocus()})',
+        returnByValue: true,
       }, sid);
+      res.end(r.result?.result?.value || '{}');
+    }
+
+    // GET /screenshot?target=xxx&file=/tmp/x.png&format=png|jpeg&nofront=1 - 截图
+    // headless 下 hidden tab 不产帧，默认先 bringToFront；nofront=1 关闭（有头环境避免抢焦点）
+    else if (pathname === '/screenshot') {
+      const autoFront = screenshotAutoFront() && !q.nofront;
+      const sid = autoFront ? await bringToFront(q.target) : await ensureSession(q.target);
+      const format = q.format || 'png';
+      const doCapture = async () => {
+        const r = await sendCDP('Page.captureScreenshot', {
+          format,
+          quality: format === 'jpeg' ? 80 : undefined,
+        }, sid);
+        if (!r?.result?.data) {
+          throw new Error(
+            (r?.error?.message || 'captureScreenshot 未返回数据') +
+            '（tab 可能不可见、正在绘制或已关闭）');
+        }
+        return r;
+      };
+
+      let resp;
+      try {
+        resp = await doCapture();
+      } catch (e) {
+        if (!autoFront) throw e;
+        await bringToFront(q.target);   // 兜底：再切一次前台重试
+        resp = await doCapture();
+      }
+
       if (q.file) {
-        fs.writeFileSync(q.file, Buffer.from(resp.result.data, 'base64'));
+        try {
+          fs.writeFileSync(q.file, Buffer.from(resp.result.data, 'base64'));
+        } catch (e) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: `截图已获取但保存失败: ${e.message}`, hint: '检查 file 路径是否合法' }));
+          return;
+        }
         res.end(JSON.stringify({ saved: q.file }));
       } else {
         res.setHeader('Content-Type', 'image/' + format);
@@ -626,7 +702,8 @@ const server = http.createServer(async (req, res) => {
           '/eval?target=': 'POST body=JS表达式 - 执行 JS',
           '/click?target=': 'POST body=CSS选择器 - 点击元素',
           '/scroll?target=&y=&direction=': 'GET - 滚动页面',
-          '/screenshot?target=&file=': 'GET - 截图',
+          '/toFront?target=': 'GET - 激活 tab 到前台（截图前调用）',
+          '/screenshot?target=&file=': 'GET - 截图（headless 默认自动 toFront，nofront=1 关闭）',
         },
       }));
     }

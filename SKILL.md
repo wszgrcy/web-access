@@ -83,6 +83,8 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 站点经验可以提供更精确的选择器、等待条件和已知中间状态，但只用于加速判断；即使没有站点经验，也必须遵循上述目标内容就绪规则。
 
+截图另有一层与 `readyState` 无关的前置条件：**tab 可见性**。`/new` 创建的是后台 tab（`document.visibilityState === "hidden"`），headless 浏览器对 hidden tab 不产帧，此时直接 `/screenshot` 会挂到 30 秒超时。`readyState === "complete"` 不代表能截图，可见性才是截图的前置条件（详见下方 Proxy API 的截图约束）。
+
 ### 补充：本地浏览器资源
 
 用户指向**本人访问过的页面**（"我之前看的那个讲 X 的文章"、"上次打开过的 XX 面板"）或**组织内部系统**（"我们的 XX 平台"、"公司那个 YY 系统"等公网搜不到的目标）时，检索本地浏览器（Chrome / Edge）书签/历史：
@@ -137,6 +139,9 @@ curl -s -X POST "http://localhost:3456/eval?target=ID" -d 'document.title'
 # 捕获页面渲染状态（含视频当前帧）
 curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
 
+# 把 tab 激活到前台，返回 {visibility, hasFocus}（截图前置条件，见下方截图约束）
+curl -s "http://localhost:3456/toFront?target=ID"
+
 # 导航（URL 走 POST body，target 走 query）、后退
 curl -s -X POST --data-raw 'https://example.com' "http://localhost:3456/navigate?target=ID"
 curl -s "http://localhost:3456/back?target=ID"
@@ -157,6 +162,13 @@ curl -s "http://localhost:3456/scroll?target=ID&direction=bottom"
 # 关闭 tab
 curl -s "http://localhost:3456/close?target=ID"
 ```
+
+**截图硬约束**：`/screenshot` 要求目标 tab 在**前台**。`/new` 创建的是后台 tab，直接截图在 headless 下会 30s 超时（`Page.captureScreenshot` 拿不到帧）。proxy 已默认在截图前自动 `bringToFront`：headless 浏览器自动开启，有头浏览器默认关闭（避免抢走用户正在看的焦点）。要点：
+
+- 默认用法不用管，直接 `/screenshot` 即可。
+- 传 `nofront=1` 关闭自动前置（例如有头环境不想动用户焦点），此时**必须**自己先调 `/toFront`，否则会复现超时。
+- 有头环境确实需要强制自动前置，可用环境变量 `CDP_SCREENSHOT_AUTO_FRONT=1` 启动 proxy。
+- `/toFront` 返回的 `visibility` 是判断依据：`visible` 才能截图；一直 `hidden` 说明窗口被最小化或有别的窗口抢占，需先处理窗口。
 
 ### 页面内导航
 

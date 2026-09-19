@@ -10,7 +10,7 @@
 ## API 端点
 
 ### GET /health
-健康检查，返回连接状态。
+健康检查，返回连接状态。额外包含 `headless`：连的是不是 headless 浏览器（决定截图是否自动前置）。
 ```bash
 curl -s http://localhost:3456/health
 ```
@@ -88,11 +88,32 @@ curl -s "http://localhost:3456/scroll?target=ID&y=3000"
 curl -s "http://localhost:3456/scroll?target=ID&direction=bottom"
 ```
 
+### GET /toFront?target=ID
+把 tab 激活到前台（`Page.bringToFront`），再等一帧绘制（`requestAnimationFrame`，最多 500ms），返回 `{ visibility, hasFocus }`。
+```bash
+curl -s "http://localhost:3456/toFront?target=ID"
+# {"visibility":"visible","hasFocus":true}
+```
+> 截图的前置条件。headless 下 `/screenshot` 已自动调用，一般不需要手动调。`visibility` 长期为 `hidden` 表示窗口被最小化或被其他窗口抢占。
+
 ### GET /screenshot?target=ID&file=/tmp/shot.png
-截图。指定 `file` 参数保存到本地文件；不指定则返回图片二进制。可选 `format=jpeg`。
+截图。指定 `file` 参数保存到本地文件；不指定则返回图片二进制。可选 `format=jpeg`（jpeg 固定 quality=80）。
 ```bash
 curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
+curl -s "http://localhost:3456/screenshot?target=ID&nofront=1&file=/tmp/shot.png"
 ```
+
+**截图必须在前台 tab。** headless=new 下 `visibilityState: "hidden"` 的 tab 不产帧，`Page.captureScreenshot` 会始终挂到 30s 超时（实测：hidden 状态下多次请求大多超时，`Page.bringToFront` 后同一请求 20~45ms 返回）。proxy 的处理：
+
+| 参数 / 环境 | 行为 |
+|------|------|
+| 默认 + headless | 先 `bringToFront` 再截图；失败再前置一次重试 |
+| 默认 + 有头 | **不**自动前置（不抢用户焦点），hidden tab 可能超时 |
+| `nofront=1` | 强制不自动前置，需自行先调 `/toFront` |
+| `CDP_SCREENSHOT_AUTO_FRONT=1` | 启动 proxy 时强制开启自动前置（包括有头） |
+| `CDP_SCREENSHOT_AUTO_FRONT=0` | 启动 proxy 时强制关闭（包括 headless） |
+
+headless 判定来自 `/json/version`：查 `Browser` **和** `User-Agent` 两个字段中的 `HeadlessChrome`。注意 Chrome 153 的 `Browser` 字段是 `"Chrome/x.y.z"`，headless 标记只出现在 `User-Agent` 里，只看 `Browser` 会漏判。判定结果在 `/health` 的 `headless` 字段暴露。
 
 ## /eval 使用提示
 
@@ -108,5 +129,7 @@ curl -s "http://localhost:3456/screenshot?target=ID&file=/tmp/shot.png"
 |------|------|------|
 | `Chrome 未开启远程调试端口` | Chrome 未开启远程调试 | 提示用户打开 `chrome://inspect/#remote-debugging` 并勾选 Allow |
 | `attach 失败` | targetId 无效或 tab 已关闭 | 用 `/targets` 获取最新列表 |
-| `CDP 命令超时` | 页面长时间未响应 | 重试或检查 tab 状态 |
+| `CDP 命令超时: Page.captureScreenshot` | tab 处于 hidden 状态不产帧 | 去掉 `nofront=1` 让 proxy 自动前置，或先调 `/toFront`；确认窗口未被最小化 |
+| `captureScreenshot 未返回数据` | CDP 返回了错误但无截图数据（tab 不可见/已关闭） | 先 `/toFront` 确认 `visibility=visible`，再重试 |
+| `截图已获取但保存失败` | `file` 路径不合法 | 用当前平台能识别的完整路径 |
 | `端口已被占用` | 另一个 proxy 已在运行 | 已有实例可直接复用 |
