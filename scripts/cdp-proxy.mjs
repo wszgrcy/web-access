@@ -68,7 +68,7 @@ let pinnedBrowser = null; // { id, label }
 
 // 是否 headless 浏览器。headless=new 下 hidden tab 不产帧，截图必须先把 tab 前置；
 // 而有头浏览器里 bringToFront 会抢用户正在看的 tab，所以自动前置只在 headless 下默认开。
-// 判定由 probeBrowserHeadless 在每次建立连接前顺手做（连不上就按有头处理）。
+// 判定在每次建立连接前读 /json/version 时顺手做（读不到就按有头处理）。
 let isHeadlessBrowser = false;
 
 // 截图前是否自动 bringToFront。CDP_SCREENSHOT_AUTO_FRONT=1/0 可强制覆盖。
@@ -104,25 +104,33 @@ async function discoverChromePort() {
   return { port: result.browser.port, wsPath: result.browser.wsPath };
 }
 
-function getWebSocketUrl(port, wsPath) {
-  if (wsPath) return `ws://127.0.0.1:${port}${wsPath}`;
-  return `ws://127.0.0.1:${port}/devtools/browser`;
-}
 
-// 连浏览器前读一次 /json/version，只为判定是否 headless（供截图自动前置策略使用）。
-// Chrome 153 的 Browser 字段是 "Chrome/x.y"，headless 标记只在 User-Agent 里，两个都要查。
-// 端点不可达或字段缺失都不影响连接：保持原值，截图按有头环境处理（不自动前置）。
-async function probeBrowserHeadless(port) {
+async function fetchBrowserVersion(port) {
   try {
     const resp = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
-    if (!resp.ok) return;
+    if (!resp.ok) return null;
     const data = await resp.json();
-    const ua = typeof data['User-Agent'] === 'string' ? data['User-Agent'] : '';
-    const browser = typeof data.Browser === 'string' ? data.Browser : '';
-    if (ua || browser) {
-      isHeadlessBrowser = /HeadlessChrome|HeadlessEdge/i.test(`${browser} ${ua}`);
-    }
-  } catch { /* 探测失败不阻断连接 */ }
+    return data && typeof data === 'object' ? data : null;
+  } catch {
+    return null;   // 探测失败不阻断连接
+  }
+}
+
+
+function rememberHeadless(version) {
+  const ua = typeof version?.['User-Agent'] === 'string' ? version['User-Agent'] : '';
+  const browser = typeof version?.Browser === 'string' ? version.Browser : '';
+  if (ua || browser) {
+    isHeadlessBrowser = /HeadlessChrome|HeadlessEdge/i.test(`${browser} ${ua}`);
+  }
+}
+
+
+function getWebSocketUrl(port, wsPath, version) {
+  const live = version?.webSocketDebuggerUrl;
+  if (typeof live === 'string' && live) return live;
+  if (wsPath) return `ws://127.0.0.1:${port}${wsPath}`;
+  return `ws://127.0.0.1:${port}/devtools/browser`;
 }
 
 // --- 连接唯一所有者：发现、握手和 CDP 请求共用同一生命周期 ---
@@ -132,8 +140,9 @@ const connection = createCdpConnection({
   discoverUrl: async () => {
     const discovered = await discoverChromePort();
     chromePort = discovered.port;
-    await probeBrowserHeadless(discovered.port);
-    return getWebSocketUrl(discovered.port, discovered.wsPath);
+    const version = await fetchBrowserVersion(discovered.port);
+    rememberHeadless(version);
+    return getWebSocketUrl(discovered.port, discovered.wsPath, version);
   },
   onConnect: () => {
     pinnedBrowser = { id: connectedBrowser.id, label: connectedBrowser.label };
